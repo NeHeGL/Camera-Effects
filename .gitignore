@@ -33,5 +33,8 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# Release script (local use only)
+release.bat
+
 # Large release binaries (host on GitHub Releases instead)
 *.zip
