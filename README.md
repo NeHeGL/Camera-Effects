@@ -1,6 +1,6 @@
 # Camera Effects Playground
 
-**© 2026 Jeff Molofee (NeHe)**
+**2026 Jeff Molofee (NeHe)**
 
 A real-time webcam effects application built with Python, PyQt6, OpenCV, and MediaPipe. All processing runs locally — no browser, no cloud, no external services.
 
