@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.spec
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Snapshots & recordings (generated output)
+snapshot_*.png
+recording_*.avi
+recording_*.mp4
+
+# Model files (large binary — download separately)
+*.tflite
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Large release binaries (host on GitHub Releases instead)
+*.zip
