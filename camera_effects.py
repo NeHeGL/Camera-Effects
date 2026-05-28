@@ -57,7 +57,10 @@ class CaptureThread(QThread):
 
 # ── Segmentation using MediaPipe ImageSegmenter (Tasks API) ───────
 # Neural-network person segmentation — works when sitting still.
-# Requires selfie_segmenter.tflite in the app folder.
+# When running from source: selfie_segmenter.tflite is downloaded automatically
+# on first use and cached next to the script for future runs.
+# When running as a frozen exe: the model is bundled inside the exe via the
+# PyInstaller spec and loaded directly from sys._MEIPASS — no download needed.
 class Segmentor:
     def __init__(self):
         self._seg  = None   # created lazily on first use
@@ -66,7 +69,11 @@ class Segmentor:
 
     def _ensure_loaded(self):
         """Load the segmentation model on first use (lazy init).
-        Downloads the model file automatically if it is missing.
+
+        From source: downloads selfie_segmenter.tflite automatically if missing,
+        then caches it next to the script for future runs.
+        From frozen exe: the model is bundled in sys._MEIPASS and always found —
+        no internet connection is required.
         """
         if self._ready:
             return True
@@ -311,7 +318,7 @@ class MainWindow(QMainWindow):
         bg_box = QGroupBox('🎨 Background Mode')
         bg_layout = QGridLayout(bg_box)
         self.bg_btns = {}
-        for i, (mode, lbl) in enumerate([('none','Normal'),('blur','Blur'),('color','Color'),('replace','Replace')]):
+        for i, (mode, lbl) in enumerate([('none','Normal'),('blur','Blur'),('color','BG Color'),('replace','BG Image')]):
             b = QPushButton(lbl)
             b.setCheckable(True)
             b.clicked.connect(lambda checked, m=mode: self._set_bg_mode(m))
