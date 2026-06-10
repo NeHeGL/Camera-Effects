@@ -23,6 +23,7 @@ recording_*.mp4
 
 # Model files (large binary — download separately)
 *.tflite
+*.task
 
 # IDE / OS
 .vscode/

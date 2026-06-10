@@ -4,6 +4,11 @@
 # Python + OpenCV + PyQt6 + MediaPipe (no browser needed)
 
 import sys, os, time, datetime
+
+# Suppress MediaPipe telemetry/clearcut logging
+os.environ['GLOG_minloglevel'] = '2'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -173,6 +178,9 @@ class MainWindow(QMainWindow):
             'rotoSpeed': 15, 'rotoZoom': 150, 'cubeSpeed': 20,
             'snowGhost': 30,
             'embossDepth': 50,
+            'hamsterScale': 190,
+            'angryIntensity': 60,
+            'slimeCount': 3, 'slimeSpeed': 40,
         }
         self.fps_frames = 0
         self.fps_time   = time.time()
@@ -503,16 +511,26 @@ class MainWindow(QMainWindow):
         info = EFFECTS[key]
         for ctrl in info.get('controls', []):
             state_key, label, unit, lo, hi, default, parse = ctrl
-            lbl = QLabel(f'{label}: {self.effect_state.get(state_key, default)}{unit}')
-            sld = QSlider(Qt.Orientation.Horizontal)
-            sld.setRange(lo, hi)
-            sld.setValue(self.effect_state.get(state_key, default))
-            def _changed(v, sk=state_key, lb=lbl, u=unit, la=label):
-                self.effect_state[sk] = v
-                lb.setText(f'{la}: {v}{u}')
-            sld.valueChanged.connect(_changed)
-            self.effect_controls_layout.addWidget(lbl)
-            self.effect_controls_layout.addWidget(sld)
+            if parse == 'bool':
+                # Render as a checkbox (lo/hi/unit ignored)
+                from PyQt6.QtWidgets import QCheckBox
+                cb = QCheckBox(label)
+                cb.setChecked(bool(self.effect_state.get(state_key, default)))
+                def _cb_changed(checked, sk=state_key):
+                    self.effect_state[sk] = int(checked)
+                cb.checkStateChanged.connect(lambda state, sk=state_key: self.effect_state.update({sk: int(state == Qt.CheckState.Checked)}))
+                self.effect_controls_layout.addWidget(cb)
+            else:
+                lbl = QLabel(f'{label}: {self.effect_state.get(state_key, default)}{unit}')
+                sld = QSlider(Qt.Orientation.Horizontal)
+                sld.setRange(lo, hi)
+                sld.setValue(self.effect_state.get(state_key, default))
+                def _changed(v, sk=state_key, lb=lbl, u=unit, la=label):
+                    self.effect_state[sk] = v
+                    lb.setText(f'{la}: {v}{u}')
+                sld.valueChanged.connect(_changed)
+                self.effect_controls_layout.addWidget(lbl)
+                self.effect_controls_layout.addWidget(sld)
         self.effect_controls_layout.addStretch(1)  # always pin content to top
 
     def _set_bg_mode(self, mode):

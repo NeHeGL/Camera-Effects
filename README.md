@@ -6,6 +6,24 @@ A real-time webcam effects application built with Python, PyQt6, OpenCV, and Med
 
 ---
 
+## What's New in v1.0.1
+
+- **Hologram** — dual independent energy bands now sweep across the frame at random intervals and directions (previously only one band)
+- **Hologram** — row-jitter now uses phase drift and random glitch bands for a more organic, non-repeating shimmer
+- **Hologram** — Scan Speed slider minimum lowered to 0 so venetian blinds can be frozen completely
+- **Added: Angry Eyes** — V-shaped brows + red eye tint driven by MediaPipe face landmarks
+- **Added: Hamster Eyes** — comically enlarged eyes using spherical-bulge warp via face landmarks
+- **Added: So Pretty** — glamour makeup overlay (blush, eyeliner, lip colour) via face landmarks
+- **Added: X-Ray** — inverted bone-scan look with blue-white tint and unsharp-mask detail boost
+- **Added: Blaze** — heat shimmer warp + fire palette (renamed from Infrared)
+- **Added: Psychedelic** — per-pixel hue cycling driven by luminance, with animated offset
+- **Added: Oil Painting** — real-time brush strokes via `cv2.xphoto.oilPainting`
+- **Added: Radar** — phosphor-green sweep scope with fading trail and animated reticle
+- **Added: Wave Distort** — whole-frame sloshing + rolling rotation warp
+- **Removed: Dream/Bloom** — replaced by the more capable Blaze and Oil Painting effects
+
+---
+
 ## Background
 
 This project evolved through several iterations before reaching its current form.
@@ -22,12 +40,13 @@ The project was built alongside my kids, who contributed ideas, tested effects l
 
 - Automatic webcam detection with support for multiple camera devices
 - **Background replacement** — Blur, Solid Color, and Custom Image modes powered by MediaPipe neural segmentation
-- **22 real-time special effects**, each with adjustable parameters:
-  - ASCII Art, Cartoon, Chromatic Aberration, Dream/Bloom
-  - Emboss, Glitch, Hologram, Kaleidoscope
-  - Mirror (Horizontal & Vertical), Neon Edge, Night Vision
-  - Pixelate, Rotating Cube, Roto-Zoom, Thermal Camera
-  - Twist/Spiral, TV Snow, Vintage/Sepia, Water Push, Wave Distort
+- **27 real-time special effects** (plus None), each with adjustable parameters:
+  - Angry Eyes, ASCII Art, Blaze, Cartoon, Chromatic Aberration
+  - Emboss, Glitch, Hamster Eyes, Hologram, Kaleidoscope
+  - Mirror (Horizontal & Vertical), Neon Edge, Night Vision, Oil Painting
+  - Pixelate, Psychedelic, Radar, Rotating Cube, Roto-Zoom
+  - So Pretty, Thermal Camera, Twist/Spiral, TV Snow
+  - Vintage/Sepia, Water Push, Wave Distort, X-Ray
 - Effects and background modes are mutually exclusive — activating one automatically disables the other
 - Snapshot output to PNG
 - Video recording to AVI
@@ -41,10 +60,10 @@ The project was built alongside my kids, who contributed ideas, tested effects l
 - Dependencies:
 
 ```bash
-pip install opencv-python numpy PyQt6 mediapipe
+pip install opencv-python opencv-contrib-python numpy PyQt6 mediapipe
 ```
 
-- The MediaPipe selfie segmentation model (`selfie_segmenter.tflite`) is not included in this repository due to file size. It is downloaded automatically from Google's MediaPipe storage the first time a Background Mode is activated, and saved next to `camera_effects.py` for all future runs.
+- The MediaPipe face landmarker model (`face_landmarker.task`) is not included in this repository due to file size. It is downloaded automatically from Google's MediaPipe storage the first time a face-landmark effect (Hamster Eyes, Angry Eyes, So Pretty) is activated, and saved next to `camera_effects.py` for all future runs.
 
 ---
 
@@ -66,7 +85,7 @@ python camera_effects.py
 Camera Effects/
 ├── camera_effects.py        # Application entry point — UI, camera loop, compositing
 ├── effects_lib.py           # Effect functions and registry
-├── selfie_segmenter.tflite  # MediaPipe segmentation model (not included in repo)
+├── face_landmarker.task     # MediaPipe face landmark model (not included in repo)
 ├── start.bat                # Windows launcher
 ├── requirements.txt         # Dependency reference
 ├── .gitignore

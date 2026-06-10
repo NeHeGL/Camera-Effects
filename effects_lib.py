@@ -1,4 +1,3 @@
-# Effects library for Camera Effects desktop app
 # 2026 Jeff Molofee (NeHe)
 import time, math, random
 import cv2
@@ -27,19 +26,70 @@ def fx_glitch(frame, state):
         out[y0:y1, :, 0] = frame[y0:y1, (xs + sb) % W, 0]
     return out
 
-def fx_hologram(frame, state):
+
+# ── Radar scope — full-colour video always visible, arm = brightness ──
+# The camera image is always shown in full colour.
+# A brightness multiplier per-pixel is derived from angular distance
+# to the sweep arm: 1.0 at the arm, fading to a dim minimum behind it.
+_radar_angle_arr = None   # (H, W) precomputed pixel angles, cached
+_radar_last_size = None   # (H, W) to detect resize
+
+def fx_radar(frame, state):
+    global _radar_angle_arr, _radar_last_size
+
     H, W = frame.shape[:2]
+    t    = time.time()
+    cx, cy = W / 2.0, H / 2.0
+
+    # ── Precompute pixel angle map once ──────────────────────────────
+    if _radar_angle_arr is None or _radar_last_size != (H, W):
+        Y, X = np.mgrid[:H, :W].astype(np.float32)
+        _radar_angle_arr = (np.arctan2(X - cx, -(Y - cy))) % (2 * math.pi)
+        _radar_last_size = (H, W)
+
+    # ── Current sweep angle (clockwise, ~4 s per rotation) ───────────
+    sweep_speed = 2 * math.pi / 4.0
+    sweep_angle = (t * sweep_speed) % (2 * math.pi)
+
+    # ang_behind: 0 = just swept by the arm (bright), increases going forward
+    # toward the arm's leading edge (dark, hasn't been swept yet)
+    # We use (sweep_angle - pixel_angle) % 2π so that:
+    #   0       = pixel is right at the arm (just swept) → brightest
+    #   2π      = pixel is just ahead of the arm         → darkest (0)
+    ang_behind = (sweep_angle - _radar_angle_arr) % (2 * math.pi)
+
+    # Fade speed: how quickly the image goes dark behind the arm.
+    # radarFade slider: 1=very slow (almost always bright), 100=very fast (goes dark quickly).
+    # We raise the linear ramp to a power: power=1 is linear, higher = faster initial drop.
+    fade_speed = state.get('radarFade', 75) / 100.0   # 0.25..1.0
+    fade_power = max(0.1, fade_speed * 4.0)            # 0.04..4.0 — controls curve shape
+
+    linear_ramp = np.clip(1.0 - ang_behind / (2 * math.pi), 0.0, 1.0)
+    bright_map = np.where(
+        ang_behind < math.radians(6),                    # crisp leading edge band
+        1.0,
+        np.power(linear_ramp, fade_power)
+    ).astype(np.float32)
+
+    # ── Convert frame to phosphor green (grayscale → green channel only) ─
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    t = time.time()
-    flicker = 0.97 + 0.03 * math.sin(t * 4.7)   # subtle, slow flicker
-    out = np.zeros((H, W, 3), dtype=np.uint8)
-    scan = (np.arange(H) % 4 < 2).astype(np.float32)
-    v = np.clip(gray * 1.5 * flicker, 0, 255) * scan[:, None]
-    out[:, :, 1] = np.clip(v * 0.9, 0, 255).astype(np.uint8)
-    out[:, :, 0] = np.clip(v * 0.6, 0, 255).astype(np.uint8)
-    bar_y = int((t * 200) % H)   # faster bar: 200 px/sec
-    bar_h = max(2, H // 60)      # thinner bar
-    out[bar_y:bar_y+bar_h, :, 1] = np.clip(out[bar_y:bar_y+bar_h, :, 1].astype(np.float32) * 1.8, 0, 255).astype(np.uint8)
+    green = np.zeros((*gray.shape, 3), dtype=np.float32)
+    green[:, :, 1] = gray   # green channel only
+    out = np.clip(green * bright_map[:, :, None], 0, 255).astype(np.uint8)
+
+    # ── Dim green reticle overlay ─────────────────────────────────────
+    max_r = min(H, W) // 2
+    reticle_col = (0, 45, 0)
+    for frac in [0.25, 0.5, 0.75, 1.0]:
+        cv2.circle(out, (int(cx), int(cy)), int(max_r * frac), reticle_col, 1, cv2.LINE_AA)
+    cv2.line(out, (int(cx), 0), (int(cx), H), reticle_col, 1, cv2.LINE_AA)
+    cv2.line(out, (0, int(cy)), (W, int(cy)), reticle_col, 1, cv2.LINE_AA)
+
+    # ── Bright sweep arm line ─────────────────────────────────────────
+    arm_ex = int(cx + math.sin(sweep_angle) * max_r)
+    arm_ey = int(cy - math.cos(sweep_angle) * max_r)
+    cv2.line(out, (int(cx), int(cy)), (arm_ex, arm_ey), (200, 220, 200), 2, cv2.LINE_AA)
+
     return out
 
 def fx_twist(frame, state):
@@ -124,20 +174,80 @@ def fx_pixelate(frame, state):
     s = cv2.resize(frame, (max(1,W//ps), max(1,H//ps)), interpolation=cv2.INTER_LINEAR)
     return cv2.resize(s, (W, H), interpolation=cv2.INTER_NEAREST)
 
+# NV scope: dynamic — mask is computed per-frame with a moving centre,
+# so we only cache the pixel coordinate grids (Y, X arrays), not the mask itself.
+_nv_grid_cache = {}   # (H, W) -> (Y, X) float32 grids
+
+def _get_nv_grids(H, W):
+    key = (H, W)
+    if key not in _nv_grid_cache:
+        Y, X = np.mgrid[:H, :W].astype(np.float32)
+        _nv_grid_cache[key] = (Y, X)
+    return _nv_grid_cache[key]
+
 def fx_night_vision(frame, state):
     H, W = frame.shape[:2]
+    t = time.time()
+
+    # ── Lissajous figure-8 scope movement ────────────────────────────
+    # Scope radius: smaller than before so it has room to wander
+    scope_r = min(H, W) * 0.32
+
+    # Travel range: how far the centre moves from frame centre
+    travel_x = (W / 2.0 - scope_r) * 0.55
+    travel_y = (H / 2.0 - scope_r) * 0.55
+
+    # Lissajous 1:2 sideways figure-8 (∞ on its side):
+    #   x(t) = sin(t)     → sweeps left←→right once per period
+    #   y(t) = sin(2t)    → sweeps up↕down TWICE per period
+    # Together this traces a classic sideways ∞ path:
+    #   start centre → top-right → centre → bottom-right →
+    #   centre → top-left → centre → bottom-left → centre
+    # Period ~20 s feels like a deliberate searching pan.
+    period = 20.0
+    ang = (t / period) * 2.0 * math.pi
+    lx = math.sin(ang)
+    ly = math.sin(2.0 * ang)
+
+    cx = W / 2.0 + lx * travel_x
+    cy = H / 2.0 + ly * travel_y
+
+    # ── Build dynamic scope mask ──────────────────────────────────────
+    Y, X = _get_nv_grids(H, W)
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+
+    fringe_w = max(8.0, scope_r * 0.05)
+    alpha = np.clip((dist - scope_r) / fringe_w, 0.0, 1.0)
+
+    # Faint ring glow at the scope edge
+    ring_w = max(3.0, scope_r * 0.02)
+    ring = np.clip(1.0 - np.abs(dist - scope_r) / ring_w, 0.0, 1.0) * 0.35
+    ring *= np.clip(1.0 - alpha, 0.0, 1.0)
+
+    # ── Apply green image + mask ──────────────────────────────────────
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
     noise = np.random.uniform(-15, 15, gray.shape).astype(np.float32)
     v = np.clip(gray * 1.4 + noise, 0, 255)
-    green = np.zeros((H, W, 3), dtype=np.uint8)
-    green[:, :, 1] = np.clip(v * 1.2, 0, 255).astype(np.uint8)
-    cy, cx = H / 2, W / 2
-    Y, X = np.ogrid[:H, :W]
-    dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    alpha = np.clip((dist - H*0.25) / (H*0.55), 0, 1) * 0.7
-    for c in range(3):
-        green[:, :, c] = np.clip(green[:, :, c].astype(np.float32) * (1 - alpha), 0, 255).astype(np.uint8)
-    return green
+
+    green = np.zeros((H, W, 3), dtype=np.float32)
+    green[:, :, 1] = np.clip(v * 1.2, 0, 255)
+
+    green *= (1.0 - alpha[:, :, None])
+    green[:, :, 1] = np.clip(green[:, :, 1] + ring * 180.0, 0, 255)
+
+    out8 = green.astype(np.uint8)
+
+    # ── Reticle centred on the moving scope ──────────────────────────
+    cx_i, cy_i = int(cx), int(cy)
+    cross_len = int(scope_r * 0.12)
+    cross_gap = int(scope_r * 0.04)
+    cross_w   = 1
+    col = (0, 55, 0)
+    cv2.line(out8, (cx_i - cross_len, cy_i), (cx_i - cross_gap, cy_i), col, cross_w, cv2.LINE_AA)
+    cv2.line(out8, (cx_i + cross_gap, cy_i), (cx_i + cross_len, cy_i), col, cross_w, cv2.LINE_AA)
+    cv2.line(out8, (cx_i, cy_i - cross_len), (cx_i, cy_i - cross_gap), col, cross_w, cv2.LINE_AA)
+    cv2.line(out8, (cx_i, cy_i + cross_gap), (cx_i, cy_i + cross_len), col, cross_w, cv2.LINE_AA)
+    return out8
 
 _THERMAL_STOPS = np.array([[0,0,0],[0,0,255],[0,255,255],[0,255,0],[255,255,0],[255,0,0],[255,255,255]], dtype=np.float32)
 _THERMAL_POS   = np.array([0, 0.15, 0.35, 0.5, 0.65, 0.85, 1.0], dtype=np.float32)
@@ -203,18 +313,19 @@ def fx_neon_edge(frame, state):
     return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 def fx_mirror(frame, state):
-    # Left half mirrored to fill the whole frame (true mirror effect)
+    # Vertical (left→right) and/or horizontal (top→bottom) mirror.
+    # mirrorVert and mirrorHoriz are bool controls (1=on, 0=off).
+    do_v = state.get('mirrorVert',  1)   # default: vertical on
+    do_h = state.get('mirrorHoriz', 0)   # default: horizontal off
     H, W = frame.shape[:2]
-    left = frame[:, :W//2, :]
-    right = cv2.flip(left, 1)
-    return np.concatenate([left, right], axis=1)
-
-def fx_mirror_h(frame, state):
-    # Top half mirrored downward
-    H, W = frame.shape[:2]
-    top = frame[:H//2, :]
     out = frame.copy()
-    out[H//2:H//2+top.shape[0], :] = cv2.flip(top, 0)
+    if do_v:
+        left  = out[:, :W//2, :]
+        right = cv2.flip(left, 1)
+        out   = np.concatenate([left, right], axis=1)
+    if do_h:
+        top = out[:H//2, :]
+        out[H//2:H//2+top.shape[0], :] = cv2.flip(top, 0)
     return out
 
 def fx_chromatic(frame, state):
@@ -224,16 +335,6 @@ def fx_chromatic(frame, state):
     out[:, :, 1] = frame[:, :, 1]
     out[:, :, 2] = np.roll(frame[:, :, 2],  shift, axis=1)
     return out
-
-def fx_dream(frame, state):
-    bloom = state.get('dreamBloom', 50) / 100.0
-    r = max(1, int(bloom * 30)) | 1
-    blurred = cv2.GaussianBlur(frame, (r, r), 0).astype(np.float32)
-    out = np.clip(frame.astype(np.float32) * 0.6 + blurred * 0.7, 0, 255).astype(np.uint8)
-    hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.int32)
-    hsv[:,:,0] = (hsv[:,:,0] + 20) % 180
-    hsv[:,:,1] = np.clip(hsv[:,:,1] * 0.7, 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 _ASCII_CHARS = ' .:-=+*#%@'
 _ascii_tile_cache = {}  # (cw, ch) -> list of 10 grayscale tiles
@@ -423,17 +524,179 @@ def fx_rotating_cube(frame, state):
         cv2.polylines(out, [dst.astype(np.int32)], True, (200,200,200), 1, cv2.LINE_AA)
     return out
 
-# ── Emboss — raised-relief grayscale effect ───────────────────────
+# ── Emboss — raised-relief with user-controlled light direction ───
 def fx_emboss(frame, state):
-    depth = state.get('embossDepth', 50) / 50.0   # 0..2, default 1.0
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    # Classic emboss kernel (northwest light source)
-    kernel = np.array([[-2*depth, -depth,  0],
-                       [-depth,    1,      depth],
-                       [ 0,        depth,  2*depth]], dtype=np.float32)
-    embossed = cv2.filter2D(gray, -1, kernel) + 128.0
-    embossed = np.clip(embossed, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(embossed, cv2.COLOR_GRAY2BGR)
+    depth     = state.get('embossDepth', 50) / 100.0   # 0..1
+    # lightDir: -100 = light far left, 0 = classic upper-left, +100 = light far right
+    # Centre (0) = 225° = classic upper-left emboss angle; sweeps ±90° to full left/right
+    light_dir = state.get('embossLight', 0) / 100.0    # -1..+1
+    azimuth = math.radians(225.0 + light_dir * 90.0)   # 135°..315° sweep
+
+    # Low elevation = strong raking light = genuine emboss shadow depth
+    elev = math.radians(25)
+    lx   =  math.cos(azimuth) * math.cos(elev)
+    ly   =  math.sin(azimuth) * math.cos(elev)
+    lz   =  math.sin(elev)
+
+    # ── Surface normals from blurred grayscale ────────────────────────
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 1.5).astype(np.float32)
+
+    bump_scale = 1.5 + depth * 3.5
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3) * (bump_scale / 255.0)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3) * (bump_scale / 255.0)
+
+    nx = -gx
+    ny = -gy
+    nz = np.ones_like(nx)
+    norm = np.sqrt(nx*nx + ny*ny + nz*nz)
+    nx /= norm;  ny /= norm;  nz /= norm
+
+    # ── Lambertian diffuse + ambient ─────────────────────────────────
+    diffuse = np.clip(nx * lx + ny * ly + nz * lz, 0.0, 1.0)
+    ambient = 0.18
+    lit = np.clip(ambient + diffuse * (1.0 - ambient), 0.0, 1.0)
+    lit = np.clip(0.05 + lit * 0.92, 0.0, 1.0)
+
+    out8 = (lit * 255.0).astype(np.uint8)
+    return cv2.cvtColor(out8, cv2.COLOR_GRAY2BGR)
+
+# ── Hologram — cyan scan-line projection effect ──────────────────
+# Layers (matching the After Effects tutorial):
+#   1. Horizontal row-jitter  — each row shifts left/right (AE Turbulent Displace)
+#   2. Cyan tint              — kill red, boost blue/green
+#   3. Venetian blinds        — horizontal scan lines sweep upward
+#   4. Soft body glow         — gaussian bloom (no edge outlines)
+#   5. Flicker                — subtle brightness oscillation
+_holo_t    = 0.0
+_holo_last = None
+_holo_grid = {}   # (sh, sw) -> (bx, by)
+
+# Energy band state — persists across frames
+_holo_band_pos = 0.0    # 0.0=top, 1.0=bottom (normalised)
+_holo_band_dir = 1.0    # +1 = moving downward, -1 = moving upward
+_holo_band_spd = 0.45   # current normalised speed (fraction of frame per second)
+
+# Second independent energy band — starts offset so both don't fire at once
+_holo_band2_pos = 0.75
+_holo_band2_dir = -1.0
+_holo_band2_spd = -3.5  # start paused so it doesn't fire immediately with band 1
+
+def _get_holo_grid(sh, sw):
+    key = (sh, sw)
+    if key not in _holo_grid:
+        bx = np.tile(np.arange(sw, dtype=np.float32), (sh, 1))
+        by = np.repeat(np.arange(sh, dtype=np.float32)[:, None], sw, axis=1)
+        _holo_grid[key] = (bx, by)
+    return _holo_grid[key]
+
+def fx_hologram(frame, state):
+    global _holo_t, _holo_last
+    now = time.time()
+    dt  = min(0.1, now - _holo_last) if _holo_last else 0.016
+    _holo_last = now
+    _holo_t    = (_holo_t + dt) % 628.318   # wrap every ~628 s to prevent float precision drift
+
+    scan_speed = state.get('holoScanSpeed', 40) / 100.0
+    glow_amt   = state.get('holoGlow',       60) / 100.0
+
+    H, W = frame.shape[:2]
+    t = _holo_t
+
+    # ALL heavy processing done at half-res; single upsample at the very end.
+    sw, sh = W // 2, H // 2
+    bx, by = _get_holo_grid(sh, sw)
+    small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+
+    # ── 1. Horizontal row-jitter at half-res (AE "Turbulent Displace") ──
+    # Three overlapping sine waves at different frequencies + a slowly evolving
+    # phase offset gives organic, non-repeating shimmer.  Occasional random
+    # glitch bands add the unpredictable spike you'd see in real holo projection.
+    row_y = np.arange(sh, dtype=np.float32)
+    # Phase drift: a low-frequency noise value per frame that changes which
+    # part of the sine cycle each row sits on, breaking periodicity
+    phase_drift = math.sin(t * 0.23) * 4.0 + math.sin(t * 0.07 + 1.1) * 6.0
+    jitter = (np.sin(row_y * 0.18 + t * 1.3 + phase_drift * 0.1) * 2.5
+            + np.sin(row_y * 0.55 + t * 2.7 - phase_drift * 0.07) * 1.0
+            + np.sin(row_y * 1.10 + t * 0.9 + phase_drift * 0.05) * 0.4)
+    # Sparse random glitch: a few rows get a larger spike on rare frames
+    if random.random() < 0.15:   # ~15% of frames get a glitch band
+        gy0 = random.randint(0, sh - 1)
+        gh  = random.randint(1, max(2, sh // 20))
+        jitter[gy0:gy0 + gh] += random.uniform(-4.0, 4.0)
+    sx = np.clip(bx + jitter[:, None], 0, sw - 1).astype(np.float32)
+    sy = by.copy()                                               # no vertical warp
+    warped_s = cv2.remap(small, sx, sy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+
+    # ── 2. Cyan tint at HALF-res — blue-dominant cyan hologram ───────
+    # Blue is the lead channel, green adds the classic sci-fi cyan glow.
+    # Ratio B:G ≈ 1.0:0.55 keeps it visually distinct from Night Vision
+    # (pure green) and Radar (phosphor green) while still reading as cyan.
+    f = warped_s.astype(np.float32)
+    lum_s = (f[:, :, 0] * 0.114 + f[:, :, 1] * 0.587 + f[:, :, 2] * 0.299)
+    cyan_s = np.zeros_like(f)
+    cyan_s[:, :, 0] = np.clip(lum_s * 1.05, 0, 255)  # B  (dominant — keeps it blue-leaning)
+    cyan_s[:, :, 1] = np.clip(lum_s * 0.55, 0, 255)  # G  (enough to read as cyan, not purple)
+    cyan_s[:, :, 2] = 0.0                              # no red
+
+    # ── 3. Venetian blinds at HALF-res ───────────────────────────────
+    # Scan Speed 0 = lines frozen; higher = faster upward scroll.
+    line_spacing_s = 2
+    scroll_s = int(_holo_t * scan_speed * 30) % line_spacing_s
+    row_phase_s = (np.arange(sh) + scroll_s) % line_spacing_s
+    dark_rows_s = row_phase_s >= 1
+    cyan_s[dark_rows_s] *= 0.05
+
+    # ── 4. Soft body glow — gaussian bloom of the cyan image, no hard edges ──
+    # Using a large blur so the glow halos outward from bright areas (person)
+    # rather than tracing every structural edge in the scene.
+    blur_k = max(3, int(glow_amt * 20) | 1)   # odd kernel, scales with glow slider
+    bloom_s = cv2.GaussianBlur(cyan_s, (blur_k, blur_k), 0)
+    cyan_s = np.clip(cyan_s + bloom_s * (glow_amt * 0.55), 0, 255)
+
+    # ── 5. Energy bands — two independent bright bars sweep at random ─
+    # Each band: _spd < 0 = pausing (counts down), >= 0 = sweeping.
+    global _holo_band_pos, _holo_band_dir, _holo_band_spd
+    global _holo_band2_pos, _holo_band2_dir, _holo_band2_spd
+    rows_s = np.arange(sh, dtype=np.float32)
+
+    # — Band 1 —
+    if _holo_band_spd < 0:
+        _holo_band_spd += dt
+    else:
+        _holo_band_pos += _holo_band_dir * _holo_band_spd * dt
+        if _holo_band_pos > 1.05 or _holo_band_pos < -0.05:
+            _holo_band_spd = -(2.0 + random.uniform(0.0, 4.0))
+            _holo_band_dir = 1.0 if random.random() < 0.5 else -1.0
+            _holo_band_pos = -0.02 if _holo_band_dir > 0 else 1.02
+        else:
+            band_row = int(_holo_band_pos * sh)
+            band_hw  = max(1, sh // 80)
+            band_alpha = np.exp(-0.5 * ((rows_s - band_row) / max(band_hw, 1)) ** 2) * 0.55
+            cyan_s = np.clip(cyan_s * (1.0 + band_alpha[:, None, None] * 0.9), 0, 255)
+
+    # — Band 2 (independent, starts offset so it doesn't fire simultaneously) —
+    if _holo_band2_spd < 0:
+        _holo_band2_spd += dt
+    else:
+        _holo_band2_pos += _holo_band2_dir * _holo_band2_spd * dt
+        if _holo_band2_pos > 1.05 or _holo_band2_pos < -0.05:
+            _holo_band2_spd = -(2.0 + random.uniform(0.0, 4.0))
+            _holo_band2_dir = 1.0 if random.random() < 0.5 else -1.0
+            _holo_band2_pos = -0.02 if _holo_band2_dir > 0 else 1.02
+        else:
+            band2_row = int(_holo_band2_pos * sh)
+            band2_hw  = max(1, sh // 80)
+            band2_alpha = np.exp(-0.5 * ((rows_s - band2_row) / max(band2_hw, 1)) ** 2) * 0.55
+            cyan_s = np.clip(cyan_s * (1.0 + band2_alpha[:, None, None] * 0.9), 0, 255)
+
+    # ── 6. Flicker (scalar — essentially free) ────────────────────────
+    flicker = 0.88 + 0.12 * math.sin(t * 17.3) * math.sin(t * 5.7)
+    cyan_s *= flicker
+
+    # ── Single upsample to full-res ───────────────────────────────────
+    return cv2.resize(np.clip(cyan_s, 0, 255).astype(np.uint8),
+                      (W, H), interpolation=cv2.INTER_LINEAR)
 
 # ── TV Snow — static noise with ghost person faintly visible ──────
 def fx_tv_snow(frame, state):
@@ -465,46 +728,492 @@ def fx_tv_snow(frame, state):
     ).astype(np.uint8)
     return out
 
-# ── Cartoon — bilateral smooth + edge outline ─────────────────────
+# ── Hamster Eyes — comically enlarged eyes using FaceLandmarker ───
+_hamster_landmarker      = None
+_hamster_landmarker_ready = False
+
+# MediaPipe 478-landmark Face Mesh eye contour indices
+# (same indices as the legacy face_mesh model, still valid for face_landmarker.task)
+_LEFT_EYE_IDX  = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+_RIGHT_EYE_IDX = [33,  7,  163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+
+_FACE_LANDMARKER_MODEL_URL = (
+    'https://storage.googleapis.com/mediapipe-models/'
+    'face_landmarker/face_landmarker/float16/latest/face_landmarker.task'
+)
+_FACE_LANDMARKER_MODEL_FILE = 'face_landmarker.task'
+
+def _ensure_hamster_landmarker():
+    global _hamster_landmarker, _hamster_landmarker_ready
+    if _hamster_landmarker_ready:
+        return _hamster_landmarker
+    try:
+        import os, sys
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        model_path = os.path.join(base, _FACE_LANDMARKER_MODEL_FILE)
+        if not os.path.exists(model_path):
+            print('[HamsterEyes] Downloading face_landmarker.task …')
+            import urllib.request
+            urllib.request.urlretrieve(_FACE_LANDMARKER_MODEL_URL, model_path)
+            print('[HamsterEyes] Download complete.')
+        from mediapipe.tasks import python as _mpt
+        from mediapipe.tasks.python import vision as _mpv
+        opts = _mpv.FaceLandmarkerOptions(
+            base_options=_mpt.BaseOptions(model_asset_path=model_path),
+            running_mode=_mpv.RunningMode.IMAGE,
+            num_faces=4,
+            min_face_detection_confidence=0.4,
+            min_face_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
+        )
+        _hamster_landmarker = _mpv.FaceLandmarker.create_from_options(opts)
+        _hamster_landmarker_ready = True
+        print('[HamsterEyes] FaceLandmarker ready.')
+    except Exception as e:
+        print(f'[HamsterEyes] Failed to load FaceLandmarker: {e}')
+        _hamster_landmarker = None
+    return _hamster_landmarker
+
+def _magnify_eye(frame, out, landmarks, eye_idx, scale):
+    """Magnify the eye region around its centre onto `out` using a circular blend."""
+    H, W = frame.shape[:2]
+    pts = np.array([(landmarks[i].x * W, landmarks[i].y * H) for i in eye_idx], dtype=np.float32)
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+
+    # Radius = half the max span of the eye bounding box
+    x0, x1 = pts[:, 0].min(), pts[:, 0].max()
+    y0, y1 = pts[:, 1].min(), pts[:, 1].max()
+    eye_r = max((x1 - x0), (y1 - y0)) / 2.0
+    if eye_r < 2:
+        return
+
+    dst_r = eye_r * scale   # magnified circle radius in the output
+    src_r = eye_r * 1.1     # source sampling radius (slightly larger than natural eye)
+
+    # Bounding box for the destination circle
+    pad  = int(dst_r) + 4
+    ox0  = max(0, int(cx - pad))
+    ox1  = min(W, int(cx + pad))
+    oy0  = max(0, int(cy - pad))
+    oy1  = min(H, int(cy + pad))
+    if ox1 <= ox0 or oy1 <= oy0:
+        return
+
+    gx = np.arange(ox0, ox1, dtype=np.float32)
+    gy = np.arange(oy0, oy1, dtype=np.float32)
+    GX, GY = np.meshgrid(gx, gy)
+
+    dx   = GX - cx
+    dy   = GY - cy
+    dist = np.sqrt(dx * dx + dy * dy).clip(1e-6)
+
+    # Spherical-bulge warp: pixels inside dst_r are pulled from a smaller source region
+    factor = np.where(dist < dst_r,
+                      (dist / dst_r) * (src_r / dist),   # = src_r / dst_r (constant)
+                      1.0)
+    sx = np.clip(cx + dx * factor, 0, W - 1).astype(np.float32)
+    sy = np.clip(cy + dy * factor, 0, H - 1).astype(np.float32)
+
+    region = cv2.remap(frame, sx, sy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    # Soft circular alpha: full opacity inside, fades over outer 20%
+    fringe = max(dst_r * 0.20, 1.0)
+    alpha  = np.clip((dst_r - dist) / fringe, 0.0, 1.0)[:, :, None]
+
+    out[oy0:oy1, ox0:ox1] = np.clip(
+        region.astype(np.float32) * alpha +
+        out[oy0:oy1, ox0:ox1].astype(np.float32) * (1.0 - alpha),
+        0, 255
+    ).astype(np.uint8)
+
+def fx_hamster_eyes(frame, state):
+    import mediapipe as mp
+    scale = state.get('hamsterScale', 190) / 100.0
+    lm_tool = _ensure_hamster_landmarker()
+    if lm_tool is None:
+        return frame
+    H, W = frame.shape[:2]
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = lm_tool.detect(mp_img)
+    out = frame.copy()
+    for face_lm_list in result.face_landmarks:
+        # face_lm_list is a list of NormalizedLandmark with .x .y .z
+        _magnify_eye(frame, out, face_lm_list, _LEFT_EYE_IDX,  scale)
+        _magnify_eye(frame, out, face_lm_list, _RIGHT_EYE_IDX, scale)
+    return out
+
+# ── Angry Eyes — angry V-shaped brows + red eye tint ─────────────
+_angry_landmarker      = None
+_angry_landmarker_ready = False
+
+def _ensure_angry_landmarker():
+    global _angry_landmarker, _angry_landmarker_ready
+    if _angry_landmarker_ready:
+        return _angry_landmarker
+    # Reuse the already-downloaded face_landmarker.task model
+    try:
+        import os, sys
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        model_path = os.path.join(base, _FACE_LANDMARKER_MODEL_FILE)
+        if not os.path.exists(model_path):
+            print('[AngryEyes] Downloading face_landmarker.task …')
+            import urllib.request
+            urllib.request.urlretrieve(_FACE_LANDMARKER_MODEL_URL, model_path)
+            print('[AngryEyes] Download complete.')
+        from mediapipe.tasks import python as _mpt
+        from mediapipe.tasks.python import vision as _mpv
+        opts = _mpv.FaceLandmarkerOptions(
+            base_options=_mpt.BaseOptions(model_asset_path=model_path),
+            running_mode=_mpv.RunningMode.IMAGE,
+            num_faces=4,
+            min_face_detection_confidence=0.4,
+            min_face_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
+        )
+        _angry_landmarker = _mpv.FaceLandmarker.create_from_options(opts)
+        _angry_landmarker_ready = True
+        print('[AngryEyes] FaceLandmarker ready.')
+    except Exception as e:
+        print(f'[AngryEyes] Failed to load FaceLandmarker: {e}')
+        _angry_landmarker = None
+    return _angry_landmarker
+
+# Brow landmark indices (MediaPipe 478-point model)
+# Left brow  (person's right, camera-left):  inner=285, outer=276
+# Right brow (person's left,  camera-right): inner=55,  outer=46
+# Full arch for natural brow shape:
+_LEFT_BROW_IDX  = [336, 296, 334, 293, 300, 276, 283, 282, 295, 285]
+_RIGHT_BROW_IDX = [107,  66, 105,  63,  70,  46,  53,  52,  65,  55]
+
+# Eye outline indices for red tinting
+_LEFT_EYE_OUTLINE  = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+_RIGHT_EYE_OUTLINE = [33,  7,  163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+
+def _draw_angry_brow(out, lm, brow_idx, H, W, intensity, flip_anger):
+    """Draw a thick angry eyebrow — fully vectorised, zero Python loops."""
+    pts = np.array([(lm[i].x * W, lm[i].y * H) for i in brow_idx], dtype=np.float32)
+    pts = pts[np.argsort(pts[:, 0])]          # sort left-to-right
+
+    n   = len(pts)
+    t   = np.linspace(0.0, 1.0, n, dtype=np.float32)  # 0=leftmost, 1=rightmost
+
+    # Lift whole brow up
+    pts[:, 1] -= intensity * 6.0
+
+    # Vectorised tilt: inner corner (right side for left brow, left for right brow) goes up
+    if flip_anger:
+        tilt = (t - 0.5) * intensity * 20.0
+    else:
+        tilt = (0.5 - t) * intensity * 20.0
+    pts[:, 1] -= tilt
+
+    thickness = max(3, int(intensity * 14))
+    pts_i = pts.astype(np.int32)
+    for i in range(n - 1):
+        cv2.line(out, tuple(pts_i[i]), tuple(pts_i[i + 1]), (0, 0, 0), thickness, cv2.LINE_AA)
+
+def _tint_eye_red(out, lm, eye_idx, H, W, alpha_f):
+    """Fill eye region with a red tint — only touches a small bounding-box crop."""
+    pts = np.array([(int(lm[i].x * W), int(lm[i].y * H)) for i in eye_idx], dtype=np.int32)
+    hull = cv2.convexHull(pts)
+
+    # Tight bounding box so we only operate on a small patch
+    x, y, bw, bh = cv2.boundingRect(hull)
+    x  = max(0, x - 4);  y  = max(0, y - 4)
+    x2 = min(W, x + bw + 8); y2 = min(H, y + bh + 8)
+    if x2 <= x or y2 <= y:
+        return
+
+    # Local mask for the eye hull
+    local_mask = np.zeros((y2 - y, x2 - x), dtype=np.uint8)
+    shifted = hull - np.array([x, y])
+    cv2.fillConvexPoly(local_mask, shifted, 255)
+
+    # Blend red into the patch in float32 — tiny patch, very cheap
+    patch = out[y:y2, x:x2].astype(np.float32)
+    m     = (local_mask > 0)[:, :, None]          # boolean mask, no allocation loop
+    patch[m[:,:,0], 2] = np.clip(patch[m[:,:,0], 2] * (1 - alpha_f) + 220 * alpha_f, 0, 255)
+    patch[m[:,:,0], 1] = np.clip(patch[m[:,:,0], 1] * (1 - alpha_f), 0, 255)
+    patch[m[:,:,0], 0] = np.clip(patch[m[:,:,0], 0] * (1 - alpha_f), 0, 255)
+    out[y:y2, x:x2] = patch.astype(np.uint8)
+
+def fx_angry_eyes(frame, state):
+    import mediapipe as mp
+    intensity = state.get('angryIntensity', 60) / 100.0
+    lm_tool = _ensure_angry_landmarker()
+    if lm_tool is None:
+        return frame
+    H, W = frame.shape[:2]
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = lm_tool.detect(mp_img)
+    out = frame.copy()
+    alpha_f = intensity * 0.55
+    for face_lm_list in result.face_landmarks:
+        _tint_eye_red(out, face_lm_list, _LEFT_EYE_OUTLINE,  H, W, alpha_f)
+        _tint_eye_red(out, face_lm_list, _RIGHT_EYE_OUTLINE, H, W, alpha_f)
+        _draw_angry_brow(out, face_lm_list, _LEFT_BROW_IDX,  H, W, intensity, flip_anger=True)
+        _draw_angry_brow(out, face_lm_list, _RIGHT_BROW_IDX, H, W, intensity, flip_anger=False)
+    return out
+
+
+# ── Pretty Pretty — glamour makeup effect ─────────────────────────
+def _pp_lm_pt(lm, idx, W, H):
+    """Return (x, y) pixel coords for landmark index idx."""
+    p = lm[idx]
+    return (int(p.x * W), int(p.y * H))
+
+def fx_so_pretty(frame, state):
+    import mediapipe as mp
+    lm_tool = _ensure_angry_landmarker()
+    if lm_tool is None:
+        return frame
+    H, W = frame.shape[:2]
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = lm_tool.detect(mp_img)
+    if not result.face_landmarks:
+        return frame
+    out = frame.copy()
+    for face_lm_list in result.face_landmarks:
+        lm = face_lm_list
+        face_w = abs(_pp_lm_pt(lm, 454, W, H)[0] - _pp_lm_pt(lm, 234, W, H)[0])
+        # Blush: average cheek landmark clusters for a stable anchor point
+        lpts_c = [_pp_lm_pt(lm, i, W, H) for i in [36, 47, 50, 205, 187]]
+        rpts_c = [_pp_lm_pt(lm, i, W, H) for i in [266, 277, 280, 425, 411]]
+        lc = (sum(p[0] for p in lpts_c)//len(lpts_c), sum(p[1] for p in lpts_c)//len(lpts_c))
+        rc = (sum(p[0] for p in rpts_c)//len(rpts_c), sum(p[1] for p in rpts_c)//len(rpts_c))
+        # Soft blush: per-cheek patch with radial distance falloff
+        r_draw = max(10, face_w // 8)
+        for cx_b, cy_b in [lc, rc]:
+            x0b = max(0, cx_b - r_draw)
+            x1b = min(W, cx_b + r_draw)
+            y0b = max(0, cy_b - r_draw)
+            y1b = min(H, cy_b + r_draw)
+            if x1b <= x0b or y1b <= y0b:
+                continue
+            gx = np.arange(x0b, x1b, dtype=np.float32) - cx_b
+            gy = np.arange(y0b, y1b, dtype=np.float32) - cy_b
+            GX, GY = np.meshgrid(gx, gy)
+            dist = np.sqrt(GX*GX + GY*GY)
+            alpha_patch = np.clip(1.0 - dist / r_draw, 0, 1) ** 1.5 * 0.55
+            blush_color = np.array([80.0, 40.0, 220.0])
+            patch = out[y0b:y1b, x0b:x1b].astype(np.float32)
+            out[y0b:y1b, x0b:x1b] = np.clip(
+                patch * (1 - alpha_patch[:,:,None]) + blush_color * alpha_patch[:,:,None],
+                0, 255).astype(np.uint8)
+        # Upper eyelid line
+        liner_w = max(2, face_w // 50)
+        for eye_idx in [[33,246,161,160,159,158,157,173,133],
+                        [362,398,384,385,386,387,388,466,263]]:
+            pts = np.array([_pp_lm_pt(lm, i, W, H) for i in eye_idx], np.int32)
+            cv2.polylines(out, [pts], False, (20, 20, 20), liner_w, cv2.LINE_AA)
+        # Upper + lower lips
+        upper_lip = [61,185,40,39,37,0,267,269,270,409,291,308,415,310,311,312,13,82,81,80,191,78]
+        lower_lip = [61,146,91,181,84,17,314,405,321,375,291,308,324,318,402,317,14,87,178,88,95,78]
+        for lip_idx in [upper_lip, lower_lip]:
+            lpts = np.array([_pp_lm_pt(lm, i, W, H) for i in lip_idx], np.int32)
+            cv2.fillPoly(out, [lpts], (30, 30, 210))
+        # Lip gloss highlight
+        lc2 = _pp_lm_pt(lm, 0, W, H)
+        gl_w = max(4, face_w // 12)
+        cv2.ellipse(out, lc2, (gl_w, max(2, gl_w//3)), 0, 180, 360, (100, 100, 240), -1, cv2.LINE_AA)
+    return out
+
+# ── X-Ray — bone-scan look ───────────────────────────────────────
+def fx_xray(frame, state):
+    contrast = state.get('xrayContrast', 60) / 100.0   # 0..1
+    H, W = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # High-frequency detail via unsharp mask — brings out edges/structure
+    blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
+    sharp = np.clip(gray * (1 + contrast * 2.5) - blur * contrast * 2.5, 0, 255)
+
+    # Invert so bright areas (flesh/clothing) become dark, edges stay bright
+    inv = 255.0 - sharp
+    inv = np.clip(inv * (0.5 + contrast * 0.8), 0, 255)
+
+    # Gamma lift to push mid-tones toward lighter bone-like appearance
+    gamma = 0.55
+    inv_norm = np.power(inv / 255.0, gamma) * 255.0
+
+    # Bluish-white X-ray tint: B=full, G=0.85, R=0.55
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+    out[:, :, 0] = np.clip(inv_norm * 1.00, 0, 255).astype(np.uint8)   # B
+    out[:, :, 1] = np.clip(inv_norm * 0.85, 0, 255).astype(np.uint8)   # G
+    out[:, :, 2] = np.clip(inv_norm * 0.55, 0, 255).astype(np.uint8)   # R
+    return out
+
+# ── Blaze — heat shimmer warp + fire palette ─────────────────────
+# The image is first warped by an animated noise field (heat distortion),
+# then the luminance of the warped result drives the fire palette.
+# This gives visible heat-haze rippling, not just a colour remap.
+# All work is at half-res; coordinate grids are cached.
+_blaze_t    = 0.0
+_blaze_last = None
+_blaze_grid = {}   # (sh, sw) -> (base_x, base_y, nx, ny) cached
+
+def _get_blaze_grid(sh, sw):
+    key = (sh, sw)
+    if key not in _blaze_grid:
+        X = np.linspace(0.0, 8.0, sw, dtype=np.float32)
+        Y = np.linspace(0.0, 8.0, sh, dtype=np.float32)
+        nx, ny = np.meshgrid(X, Y)
+        # Base pixel coordinate grids for remapping
+        bx = np.tile(np.arange(sw, dtype=np.float32), (sh, 1))
+        by = np.repeat(np.arange(sh, dtype=np.float32)[:, None], sw, axis=1)
+        _blaze_grid[key] = (bx, by, nx, ny)
+    return _blaze_grid[key]
+
+def fx_infrared(frame, state):
+    global _blaze_t, _blaze_last
+    glow = state.get('infraredGlow', 60) / 100.0
+    now  = time.time()
+    dt   = min(0.1, now - _blaze_last) if _blaze_last else 0.016
+    _blaze_last = now
+    _blaze_t   += dt * 0.5
+
+    H, W = frame.shape[:2]
+    sw, sh = W // 2, H // 2
+    t = _blaze_t
+
+    small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+    bx, by, nx, ny = _get_blaze_grid(sh, sw)
+
+    # --- heat shimmer warp with strong upward bias (flames rise) ---
+    warp_strength = 4.0
+    # dx: side-to-side flicker
+    dx = (np.sin(ny * 1.8 + t * 2.1) * np.cos(nx * 1.3 + t * 0.7)) * warp_strength
+    # dy: upward bias — base upward drift + turbulence, net motion is upward
+    dy_turb = (np.cos(ny * 2.2 - t * 2.8) * np.sin(nx * 1.6 - t * 1.9)) * warp_strength * 0.4
+    dy_rise = -ny / 8.0 * warp_strength * 1.2   # steady upward pull (ny goes 0..8, top=0)
+    dy = dy_turb + dy_rise
+    src_x = np.clip(bx + dx, 0, sw - 1).astype(np.float32)
+    src_y = np.clip(by + dy, 0, sh - 1).astype(np.float32)
+    warped = cv2.remap(small, src_x, src_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REFLECT_101)
+
+    # --- heat source: thin edge lines + luminance interior ---
+    gray_s = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lum = gray_s / 255.0
+
+    gx_ = cv2.Sobel(gray_s, cv2.CV_32F, 1, 0, ksize=3)
+    gy_ = cv2.Sobel(gray_s, cv2.CV_32F, 0, 1, ksize=3)
+    # Divide by 120 (was 60) → edges are half as thick/bright on flat areas like faces
+    edges = np.clip(np.sqrt(gx_*gx_ + gy_*gy_) / 120.0, 0, 1)
+    # Reduce edge contribution slightly so interior fill dominates on smooth skin
+    heat = np.clip(edges * 0.45 + lum * 0.55, 0, 1)
+
+    # Bloom spreads the fire glow outward — upward-biased blur kernel
+    heat8   = (heat * 255).astype(np.uint8)
+    sig     = max(1, int(glow * 9))
+    bloomed = cv2.GaussianBlur(heat8.astype(np.float32), (0, 0), sigmaX=sig * 0.6, sigmaY=sig)
+    heat = np.clip(heat * 255 * 0.5 + bloomed * 0.6, 0, 255) / 255.0
+
+    # Glow shifts palette: dim → red outlines, high → orange/yellow bloom
+    scale = 2.5 + glow * 1.5
+    r = np.clip(heat * scale,        0, 1)
+    g = np.clip(heat * scale - 1.2,  0, 1)
+    b = np.clip(heat * scale - 3.5,  0, 1)
+
+    out_s = np.zeros((sh, sw, 3), dtype=np.uint8)
+    out_s[:, :, 2] = (r * 255).astype(np.uint8)
+    out_s[:, :, 1] = (g * 255).astype(np.uint8)
+    out_s[:, :, 0] = (b * 255).astype(np.uint8)
+
+    return cv2.resize(out_s, (W, H), interpolation=cv2.INTER_LINEAR)
+
+# ── Psychedelic — per-pixel hue cycling based on luminance ───────
+_psycho_offset = 0.0
+_psycho_last   = None
+
+def fx_psychedelic(frame, state):
+    global _psycho_offset, _psycho_last
+    speed = state.get('psychoSpeed', 50) / 100.0
+    now   = time.time()
+    dt    = min(0.1, now - _psycho_last) if _psycho_last else 0.016
+    _psycho_last = now
+    _psycho_offset = (_psycho_offset + speed * dt * 180.0) % 180.0
+
+    H, W = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+    # Per-pixel hue shift based on luminance — creates morphing rainbow bands
+    lum_shift = (hsv[:, :, 2] / 255.0) * 90.0   # 0..90 degrees based on brightness
+    hsv[:, :, 0] = (hsv[:, :, 0] + _psycho_offset + lum_shift) % 180.0
+
+    # Boost saturation to full
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.5 + 40, 0, 255)
+
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+# ── Oil Painting — cv2.xphoto.oilPainting (native C++, real-time) ─
+def fx_oil_painting(frame, state):
+    """Oil painting via cv2.xphoto.oilPainting — runs in C++ at full speed.
+
+    oilRadius slider (2-8): brush neighbourhood size (odd values work best)
+    oilLevels slider (3-16): intensity quantisation levels
+    """
+    radius = max(1, state.get('oilRadius', 4))
+    levels = max(3, state.get('oilLevels', 8))
+
+    # oilPainting needs an odd neighbourhood size
+    size = radius * 2 + 1
+
+    result = cv2.xphoto.oilPainting(frame, size, levels)
+
+    # Saturation boost for that rich, paint-from-a-tube look
+    hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.4 + 15, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+# ── Cartoon — cel shading (hard quantized light bands, video-game look) ──
 def fx_cartoon(frame, state):
-    level = max(1, min(10, state.get('cartoonLevel', 5)))
+    """True cel shading: quantize luminance into hard bands, keep full hue,
+    then add crisp ink outlines.  Looks like Borderlands / Wind Waker."""
+    level  = max(2, min(8, state.get('cartoonLevel', 4)))   # number of shade bands
     H, W = frame.shape[:2]
 
-    # 1. Bilateral filter at half-res: more passes = flatter comic-book colours
-    small = cv2.resize(frame, (W // 2, H // 2))
-    passes = 1 + level // 3          # 1..4 passes as level goes 1..10
-    sigma  = 40 + level * 8          # 48..120: stronger smoothing at high level
-    for _ in range(passes):
-        small = cv2.bilateralFilter(small, d=9, sigmaColor=sigma, sigmaSpace=sigma)
-    smooth = cv2.resize(small, (W, H))
+    # 1. Light smooth to kill sensor noise without smearing colour boundaries
+    smooth = cv2.bilateralFilter(frame, d=7, sigmaColor=60, sigmaSpace=60)
 
-    # 2. Edge mask: lower C = more edges = more inky at high cartoonLevel
+    # 2. Convert to HSV; quantize V (brightness) into `level` hard steps
+    hsv = cv2.cvtColor(smooth, cv2.COLOR_BGR2HSV).astype(np.float32)
+    v   = hsv[:, :, 2] / 255.0                          # 0..1
+    # Hard quantize: floor to nearest band, then snap to band centre
+    v_q = (np.floor(v * level) / level + 0.5 / level).clip(0, 1)
+    # Boost saturation for that vivid toon look
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.4 + 20, 0, 255)
+    hsv[:, :, 2] = (v_q * 255).astype(np.float32)
+    cel = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    # 3. Crisp ink outlines from the original frame's luminance
     gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray  = cv2.medianBlur(gray, 5)
-    C_val = max(1, 8 - level // 2)   # 8..3: fewer missed edges as level rises
-    edges = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=9, C=C_val)
-    edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    gray  = cv2.medianBlur(gray, 3)
+    edges = cv2.Canny(gray, 60, 160)
+    # Slightly thicken lines so they read well at any resolution
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+    ink   = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
 
-    # 3. Combine
-    return cv2.bitwise_and(smooth, edges)
+    # 4. Stamp black ink onto cel colours
+    return np.where(ink > 0, 0, cel).astype(np.uint8)
 
-# Effect registry — alphabetical by label (None pinned first)
-EFFECTS = {
+# Effect registry — None pinned first, rest sorted alphabetically by label
+_EFFECTS_RAW = {
     'none':          {'label': 'None',               'icon': '🚫', 'fn': fx_none,          'controls': []},
     'ascii':         {'label': 'ASCII Art',          'icon': '📝', 'fn': fx_ascii,         'controls': [('asciiRes','Resolution','px',4,20,8,'int')]},
-    'cartoon':       {'label': 'Cartoon',            'icon': '🖼', 'fn': fx_cartoon,       'controls': [('cartoonLevel','Intensity','',1,10,5,'int')]},
+    'cartoon':       {'label': 'Cartoon',            'icon': '🖼', 'fn': fx_cartoon,       'controls': [('cartoonLevel','Shade Bands','',2,8,4,'int')]},
     'chromatic':     {'label': 'Chromatic Aberr.',   'icon': '🌈', 'fn': fx_chromatic,     'controls': [('chromaticShift','Shift','px',1,20,6,'int')]},
-    'dream':         {'label': 'Dream/Bloom',        'icon': '✨', 'fn': fx_dream,         'controls': [('dreamBloom','Bloom','%',0,100,50,'int')]},
-    'emboss':        {'label': 'Emboss',             'icon': '🗿', 'fn': fx_emboss,        'controls': [('embossDepth','Depth','%',10,100,50,'int')]},
+    'emboss':        {'label': 'Emboss',             'icon': '🗿', 'fn': fx_emboss,        'controls': [('embossDepth','Depth','%',10,100,50,'int'),('embossLight','Light','',-100,100,0,'int')]},
     'glitch':        {'label': 'Glitch',             'icon': '⚡', 'fn': fx_glitch,        'controls': [('glitchIntensity','Intensity','%',10,100,50,'int')]},
-    'hologram':      {'label': 'Hologram',           'icon': '👾', 'fn': fx_hologram,      'controls': []},
+    'hologram':      {'label': 'Hologram',           'icon': '👾', 'fn': fx_hologram,      'controls': [('holoScanSpeed','Scan Speed','%',0,100,40,'int'),('holoGlow','Glow','%',10,100,60,'int')]},
+    'angry_eyes':    {'label': 'Angry Eyes',         'icon': '😤', 'fn': fx_angry_eyes,    'controls': [('angryIntensity','Intensity','%',10,100,60,'int')]},
+    'hamster_eyes':  {'label': 'Hamster Eyes',       'icon': '🐹', 'fn': fx_hamster_eyes,  'controls': [('hamsterScale','Eye Size','%',150,240,190,'int')]},
+    'radar':         {'label': 'Radar',              'icon': '📡', 'fn': fx_radar,         'controls': [('radarFade','Fade Speed','%',25,100,75,'int')]},
     'kaleidoscope':  {'label': 'Kaleidoscope',       'icon': '🔯', 'fn': fx_kaleidoscope,  'controls': [('kaleidoSegments','Segments','',2,16,6,'int')]},
-    'mirror':        {'label': 'Mirror Vert.',       'icon': '🪞', 'fn': fx_mirror,        'controls': []},
-    'mirror_h':      {'label': 'Mirror Horiz',       'icon': '↕️', 'fn': fx_mirror_h,      'controls': []},
+    'mirror':        {'label': 'Mirror',             'icon': '🪞', 'fn': fx_mirror,        'controls': [('mirrorVert','Mirror Vertical','',0,1,1,'bool'),('mirrorHoriz','Mirror Horizontal','',0,1,0,'bool')]},
     'neon_edge':     {'label': 'Neon Edge',          'icon': '💜', 'fn': fx_neon_edge,     'controls': []},
     'night_vision':  {'label': 'Night Vision',       'icon': '🌙', 'fn': fx_night_vision,  'controls': []},
     'pixelate':      {'label': 'Pixelate',           'icon': '🟦', 'fn': fx_pixelate,      'controls': [('pixelSize','Pixel Size','px',4,32,12,'int')]},
@@ -512,9 +1221,22 @@ EFFECTS = {
     'cube':          {'label': 'Rotating Cube',      'icon': '🎲', 'fn': fx_rotating_cube, 'controls': [('cubeSpeed','Spin','',-100,100,10,'int')]},
     'thermal':       {'label': 'Thermal Camera',     'icon': '🌡', 'fn': fx_thermal,       'controls': []},
     'twist':         {'label': 'Twist/Spiral',       'icon': '🌀', 'fn': fx_twist,         'controls': [('twistAmount','Twist','%',0,100,50,'int')]},
-    'tv_snow':       {'label': 'TV Snow',             'icon': '📺', 'fn': fx_tv_snow,       'controls': [('snowGhost','Ghost Strength','%',0,80,30,'int')]},
+    'tv_snow':       {'label': 'TV Snow',            'icon': '📺', 'fn': fx_tv_snow,       'controls': [('snowGhost','Ghost Strength','%',0,80,30,'int')]},
     'vintage_sepia': {'label': 'Vintage/Sepia',      'icon': '📷', 'fn': fx_vintage_sepia, 'controls': []},
     'water_push':    {'label': 'Water Push',         'icon': '💧', 'fn': fx_water_push,    'controls': [('waterStrength','Strength','',1,80,30,'int')]},
+    'so_pretty':     {'label': 'So Pretty',          'icon': '💄', 'fn': fx_so_pretty,     'controls': []},
+    'xray':          {'label': 'X-Ray',              'icon': '🦴', 'fn': fx_xray,          'controls': [('xrayContrast','Contrast','%',10,100,60,'int')]},
+    'infrared':      {'label': 'Blaze',              'icon': '🔥', 'fn': fx_infrared,      'controls': [('infraredGlow','Glow','%',10,100,60,'int')]},
+    'psychedelic':   {'label': 'Psychedelic',        'icon': '🌈', 'fn': fx_psychedelic,   'controls': [('psychoSpeed','Speed','%',5,100,50,'int')]},
+    'oil_painting':  {'label': 'Oil Painting',       'icon': '🖌', 'fn': fx_oil_painting,  'controls': [('oilRadius','Brush Size','',2,8,4,'int'),('oilLevels','Paint Levels','',3,16,8,'int')]},
     'wave':          {'label': 'Wave Distort',       'icon': '〰️', 'fn': fx_wave,          'controls': [('waveAmplitude','Amplitude','px',1,50,20,'int'),('waveFrequency','Frequency','',1,15,5,'int')]},
 }
+
+# Pin 'none' first, then sort the rest alphabetically by label
+EFFECTS = {'none': _EFFECTS_RAW['none']} | dict(
+    sorted(
+        ((k, v) for k, v in _EFFECTS_RAW.items() if k != 'none'),
+        key=lambda kv: kv[1]['label'].lower()
+    )
+)
 
