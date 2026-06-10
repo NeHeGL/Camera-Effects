@@ -743,14 +743,23 @@ _FACE_LANDMARKER_MODEL_URL = (
 )
 _FACE_LANDMARKER_MODEL_FILE = 'face_landmarker.task'
 
+def _get_model_path():
+    """Return a persistent path for face_landmarker.task next to the exe (or script)."""
+    import os, sys
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller exe — save next to the exe so it persists across runs
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, _FACE_LANDMARKER_MODEL_FILE)
+
 def _ensure_hamster_landmarker():
     global _hamster_landmarker, _hamster_landmarker_ready
     if _hamster_landmarker_ready:
         return _hamster_landmarker
     try:
-        import os, sys
-        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-        model_path = os.path.join(base, _FACE_LANDMARKER_MODEL_FILE)
+        import os
+        model_path = _get_model_path()
         if not os.path.exists(model_path):
             print('[HamsterEyes] Downloading face_landmarker.task …')
             import urllib.request
@@ -853,9 +862,8 @@ def _ensure_angry_landmarker():
         return _angry_landmarker
     # Reuse the already-downloaded face_landmarker.task model
     try:
-        import os, sys
-        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-        model_path = os.path.join(base, _FACE_LANDMARKER_MODEL_FILE)
+        import os
+        model_path = _get_model_path()
         if not os.path.exists(model_path):
             print('[AngryEyes] Downloading face_landmarker.task …')
             import urllib.request
