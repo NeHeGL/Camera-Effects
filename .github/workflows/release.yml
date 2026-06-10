@@ -36,7 +36,7 @@ jobs:
         shell: pwsh
         run: |
           $version  = "${{ github.ref_name }}"
-          $zipName  = "CameraEffects-$version-windows-x64.zip"
+          $zipName  = "Camera-Effects-$version-windows-x64.zip"
           Compress-Archive -Path dist\CameraEffects.exe, README.md -DestinationPath $zipName -Force
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
@@ -48,7 +48,7 @@ jobs:
             ## Camera Effects ${{ github.ref_name }}
 
             ### Installation
-            1. Download `CameraEffects-${{ github.ref_name }}-windows-x64.zip`
+            1. Download `Camera-Effects-${{ github.ref_name }}-windows-x64.zip`
             2. Extract and run `CameraEffects.exe` — no installation required.
 
             ### Requirements
