@@ -8,7 +8,6 @@ __pycache__/
 dist/
 build/
 .eggs/
-*.spec
 
 # Virtual environments
 venv/
