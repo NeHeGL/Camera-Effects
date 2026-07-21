@@ -1,0 +1,10 @@
+# Camera Effects Playground
+# 2026 Jeff Molofee (NeHe)
+#
+# Install dependencies:
+#   pip install -r requirements.txt
+
+opencv-python
+numpy
+PyQt6
+mediapipe
