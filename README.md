@@ -6,6 +6,18 @@ A real-time webcam effects application built with Python, PyQt6, OpenCV, and Med
 
 ---
 
+## What's New in v1.0.3
+
+Halloween update — four new face-tracked / look effects:
+
+- **Added: Zombie** — sickly green-grey skin, sunken eye sockets, rot patches and wounds that stay glued to your face, milky dead eyes, and blood from the corner of the mouth (Decay and Blood sliders)
+- **Added: Skeleton** — bone-white skull face with eye sockets, nose cavity, teeth lines that follow your mouth, and optional Día de los Muertos flower decoration and glowing eyes
+- **Added: Mummy** — bandage wrap over your face and head that follows head turns, leaves your eyes and ears clear, with a Grime slider
+- **Added: Pro-Mist** — high-contrast, film-style black-and-white with highlight bloom and soft glow (Glow, Softness, and Black & White sliders)
+- **Added: Vampire** (was "Vampire Teeth") — face-tracked fangs, glowing eyes, and bat wings; the wings now sit on the skull and follow head turns instead of floating off it
+- **Changed:** Pro-Mist takes the place of Chromatic Aberration in the effects list
+- **Removed:** Hologram
+
 ## What's New in v1.0.2
 
 - **Added: Sid Eyes** — pushes the eyes outward toward the sides of the head via face landmarks, sloth-stare style, using a thin-plate-spline face warp
@@ -46,13 +58,13 @@ The project was built alongside my kids, who contributed ideas, tested effects l
 
 - Automatic webcam detection with support for multiple camera devices
 - **Background replacement** — Blur, Solid Color, and Custom Image modes powered by MediaPipe neural segmentation
-- **28 real-time special effects** (plus None), each with adjustable parameters:
-  - Angry Eyes, ASCII Art, Blaze, Cartoon, Chromatic Aberration
-  - Emboss, Glitch, Hamster Eyes, Hologram, Kaleidoscope
-  - Mirror (Horizontal & Vertical), Neon Edge, Night Vision, Oil Painting
-  - Pixelate, Psychedelic, Radar, Rotating Cube, Roto-Zoom
-  - So Pretty, Sid Eyes, Thermal Camera, Twist/Spiral, TV Snow
-  - Vintage/Sepia, Water Push, Wave Distort, X-Ray
+- **31 real-time special effects** (plus None), each with adjustable parameters:
+  - Angry Eyes, ASCII Art, Blaze, Cartoon, Emboss
+  - Glitch, Hamster Eyes, Kaleidoscope, Mirror (Horizontal & Vertical), Mummy
+  - Neon Edge, Night Vision, Oil Painting, Pixelate, Pro-Mist
+  - Psychedelic, Radar, Rotating Cube, Roto-Zoom, Sid Eyes
+  - Skeleton, So Pretty, Thermal Camera, Twist/Spiral, TV Snow
+  - Vampire, Vintage/Sepia, Water Push, Wave Distort, X-Ray, Zombie
 - Effects and background modes are mutually exclusive — activating one automatically disables the other
 - Snapshot output to PNG
 - Video recording to AVI
@@ -69,7 +81,7 @@ The project was built alongside my kids, who contributed ideas, tested effects l
 pip install opencv-python opencv-contrib-python numpy PyQt6 mediapipe
 ```
 
-- The MediaPipe face landmarker model (`face_landmarker.task`) is not included in this repository due to file size. It is downloaded automatically from Google's MediaPipe storage the first time a face-landmark effect (Hamster Eyes, Angry Eyes, So Pretty, Sid Eyes) is activated, and saved next to `camera_effects.py` for all future runs.
+- The MediaPipe face landmarker model (`face_landmarker.task`) is not included in this repository due to file size. It is downloaded automatically from Google's MediaPipe storage the first time a face-landmark effect (Hamster Eyes, Angry Eyes, So Pretty, Sid Eyes, Vampire, Zombie, Skeleton, Mummy) is activated, and saved next to `camera_effects.py` for all future runs.
 
 ---
 
