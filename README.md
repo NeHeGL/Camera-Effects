@@ -6,6 +6,15 @@ A real-time webcam effects application built with Python, PyQt6, OpenCV, and Med
 
 ---
 
+## What's New in v1.0.4
+
+- **Added: Beauty (美颜)** — a Chinese-style face beauty filter, face-tracked and running locally:
+  - **Style** presets: Natural, Pink-White 粉白 (default), Cool-White 冷白, Japanese Soft 日系
+  - **Skin Smoothing** that keeps natural texture, **Whitening** with soft highlights (backs off on already-bright skin)
+  - **Big Eyes** (with under-eye brightening), **Slim Face** (jaw, chin and nose), **Rosy Cheeks & Lips**, and **Soft Glow**
+- **Changed: effects panel** — the left column was widened and the effect buttons now sit in **3 columns** (was 2) to make room for more effects
+- **Changed: Effect Controls** — the control area now sizes itself to the effect with the most sliders, so every control is visible without scrolling; the window opens slightly larger by default
+
 ## What's New in v1.0.3
 
 Halloween update — four new face-tracked / look effects:
@@ -59,7 +68,7 @@ The project was built alongside my kids, who contributed ideas, tested effects l
 - Automatic webcam detection with support for multiple camera devices
 - **Background replacement** — Blur, Solid Color, and Custom Image modes powered by MediaPipe neural segmentation
 - **31 real-time special effects** (plus None), each with adjustable parameters:
-  - Angry Eyes, ASCII Art, Blaze, Cartoon, Emboss
+  - Angry Eyes, ASCII Art, Beauty (美颜), Blaze, Cartoon, Emboss
   - Glitch, Hamster Eyes, Kaleidoscope, Mirror (Horizontal & Vertical), Mummy
   - Neon Edge, Night Vision, Oil Painting, Pixelate, Pro-Mist
   - Psychedelic, Radar, Rotating Cube, Roto-Zoom, Sid Eyes
@@ -81,7 +90,7 @@ The project was built alongside my kids, who contributed ideas, tested effects l
 pip install opencv-python opencv-contrib-python numpy PyQt6 mediapipe
 ```
 
-- The MediaPipe face landmarker model (`face_landmarker.task`) is not included in this repository due to file size. It is downloaded automatically from Google's MediaPipe storage the first time a face-landmark effect (Hamster Eyes, Angry Eyes, So Pretty, Sid Eyes, Vampire, Zombie, Skeleton, Mummy) is activated, and saved next to `camera_effects.py` for all future runs.
+- The MediaPipe face landmarker model (`face_landmarker.task`) is not included in this repository due to file size. It is downloaded automatically from Google's MediaPipe storage the first time a face-landmark effect (Hamster Eyes, Angry Eyes, So Pretty, Sid Eyes, Vampire, Zombie, Skeleton, Mummy, Beauty) is activated, and saved next to `camera_effects.py` for all future runs.
 
 ---
 

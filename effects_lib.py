@@ -2048,6 +2048,207 @@ def fx_cartoon(frame, state):
     # 4. Stamp black ink onto cel colours
     return np.where(ink > 0, 0, cel).astype(np.uint8)
 
+# ── Beauty (美颜) — frequency-separated retouch, LAB whitening, face/eye/nose warps, glow ──
+_BEAUTY_WORK = 320          # long side (px) of the working-resolution face crop
+_beauty_prev = {'pts': None}
+# Colour-grade styles, applied to the skin independent of the Whitening slider:
+# (mid-tone lift, a shift [+ = pink], b shift [- = cooler], saturation, black lift, extra glow)
+_BEAUTY_STYLES = [
+    (0.00,  0.0,   0.0, 1.00, 0.00, 0.00),   # Natural: no grade
+    (0.24,  3.0,  -6.0, 0.95, 0.00, 0.05),   # Pink-White (粉白): rosy porcelain
+    (0.26, -1.0,  -7.0, 0.95, 0.00, 0.00),   # Cool-White (冷白): blue-ish snow white
+    (0.20,  3.0,  -5.0, 0.82, 0.10, 0.18),   # Japanese Soft (日系): airy, faded, low contrast
+]
+
+def _beauty_stabilise(faces):
+    """Temporal smoothing of landmarks (adaptive: still face = heavy smoothing, fast motion = none)."""
+    prev = _beauty_prev['pts']
+    glob = [f[4] + np.array([f[0], f[1]], np.float32) for f in faces]
+    if prev is not None and len(prev) == len(glob):
+        for i, g in enumerate(glob):
+            fw = float(np.linalg.norm(g[454] - g[234]))
+            motion = float(np.abs(g - prev[i]).mean()) / max(fw, 1.0)
+            a = float(np.clip(0.2 + motion * 40.0, 0.2, 1.0))
+            glob[i] = prev[i] + (g - prev[i]) * a
+    _beauty_prev['pts'] = [g.copy() for g in glob]
+    out = []
+    for f, g in zip(faces, glob):
+        out.append((f[0], f[1], f[2], f[3], g - np.array([f[0], f[1]], np.float32), f[5], f[6]))
+    return out
+
+def _beauty_field(shape, pts, fw, eyes, slim):
+    """Displacement field (dx, dy) at working resolution: sample position = pixel + (dx, dy)."""
+    h, w = shape
+    gx = np.arange(w, dtype=np.float32)[None, :]
+    gy = np.arange(h, dtype=np.float32)[:, None]
+    dx = np.zeros((h, w), np.float32)
+    dy = np.zeros((h, w), np.float32)
+    if eyes > 0:
+        for outline, centre, ew, _ in _eye_info(pts):
+            r = ew * 1.15
+            ddx, ddy = gx - centre[0], gy - centre[1]
+            d2 = (ddx * ddx + ddy * ddy) / (r * r)
+            k = -eyes * 0.36 * np.clip(1.0 - d2, 0, 1) ** 2        # sample nearer the centre => magnify
+            dx += k * ddx
+            dy += k * ddy
+    if slim > 0:
+        u, down = _axes(pts)
+        centre = pts[[10, 152]].mean(0)
+
+        def pull(idx, sigma, amt, lift=0.0, ctr=None):
+            p = pts[idx]
+            side = 1.0 if float((p - (centre if ctr is None else ctr)) @ u) > 0 else -1.0
+            r = int(3 * sigma) + 1
+            xa, xb = max(0, int(p[0]) - r), min(w, int(p[0]) + r + 1)
+            ya, yb = max(0, int(p[1]) - r), min(h, int(p[1]) + r + 1)
+            if xb <= xa or yb <= ya:
+                return
+            fall = np.exp(-((gx[:, xa:xb] - p[0]) ** 2 + (gy[ya:yb] - p[1]) ** 2) / (2 * sigma * sigma))
+            dx[ya:yb, xa:xb] += fall * (u[0] * side * amt + down[0] * lift)
+            dy[ya:yb, xa:xb] += fall * (u[1] * side * amt + down[1] * lift)
+
+        for idx in (234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 377, 400, 378, 379, 365, 397, 288, 361, 323, 454):
+            pull(idx, fw * 0.15, slim * fw * 0.03)
+        for idx in (152, 148, 377):                                   # chin: lift + narrow
+            pull(idx, fw * 0.12, slim * fw * 0.012, lift=slim * fw * 0.025)
+        nctr = pts[[168, 4]].mean(0)
+        for idx in (129, 358, 98, 327, 49, 279):                       # nose wings in
+            pull(idx, fw * 0.05, slim * fw * 0.014, ctr=nctr)
+    return dx, dy
+
+def _skin_tone(img_u8):
+    """Soft 0..1 'looks like skin' weight from YCrCb, so beard, hair and background are spared."""
+    ycc = cv2.cvtColor(img_u8, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+    cr, cb = ycc[..., 1], ycc[..., 2]
+    wr = np.clip(np.minimum(cr - 128, 178 - cr) / 8.0, 0, 1)
+    wb = np.clip(np.minimum(cb - 72, 128 - cb) / 8.0, 0, 1)
+    return cv2.GaussianBlur(wr * wb, (0, 0), 1.5)
+
+def fx_beauty(frame, state):
+    smooth = state.get('beautySmooth', 70) / 100.0
+    white  = state.get('beautyWhite', 40) / 100.0
+    eyes   = state.get('beautyEyes', 40) / 100.0
+    slim   = state.get('beautySlim', 40) / 100.0
+    blush  = state.get('beautyBlush', 40) / 100.0
+    glow   = state.get('beautyGlow', 30) / 100.0
+    style  = _BEAUTY_STYLES[int(np.clip(state.get('beautyStyle', 1), 0, len(_BEAUTY_STYLES) - 1))]
+    glow   = min(0.7, glow + style[5])
+    eyes0, slim0 = eyes, slim
+    faces = _monster_faces(frame)
+    if not faces:
+        _beauty_prev['pts'] = None
+        return frame
+    out = frame.copy()
+    for x0, y0, x1, y1, pts, fw, z in _beauty_stabilise(faces):
+        roi = out[y0:y1, x0:x1]
+        H, W = roi.shape[:2]
+        s = min(1.0, _BEAUTY_WORK / max(H, W))
+        h, w = max(8, int(round(H * s))), max(8, int(round(W * s)))
+        sx, sy = w / W, h / H
+        ps, fws = pts * np.array([sx, sy], np.float32), fw * (sx + sy) * 0.5
+        size_k = float(np.clip(fw / (0.10 * frame.shape[1]), 0.0, 1.0))   # far/tiny faces: gentler warps
+        if size_k < 0.4:
+            size_k = 0.0                                                  # landmarks too noisy to warp
+        eyes, slim = eyes0 * size_k, slim0 * size_k
+        u, down = _axes(ps)
+        angle = math.degrees(math.atan2(u[1], u[0]))
+
+        # --- geometry: one displacement field, applied at both resolutions ---
+        small0 = cv2.resize(roi, (w, h), interpolation=cv2.INTER_AREA)
+        if eyes > 0 or slim > 0:
+            dx, dy = _beauty_field((h, w), ps, fws, eyes, slim)
+            gx = np.arange(w, dtype=np.float32)[None, :]
+            gy = np.arange(h, dtype=np.float32)[:, None]
+            base = cv2.remap(small0, gx + dx, gy + dy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            Gx = np.arange(W, dtype=np.float32)[None, :] + cv2.resize(dx, (W, H)) / sx
+            Gy = np.arange(H, dtype=np.float32)[:, None] + cv2.resize(dy, (W, H)) / sy
+            full = cv2.remap(roi, Gx, Gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        else:
+            base, full = small0, roi
+        base_f = base.astype(np.float32)
+
+        # --- masks (working resolution) ---
+        skin = _oval_mask(ps, (h, w), fws)
+        keep = np.zeros((h, w), np.float32)
+        for idx_list in (_LEFT_EYE_OUTLINE, _RIGHT_EYE_OUTLINE, _LEFT_BROW_IDX, _RIGHT_BROW_IDX, _MOUTH_OUTER_LOOP):
+            keep = np.maximum(keep, _poly_mask((h, w), ps[idx_list], max(1.0, fws * 0.012)))
+        skin = skin * (1.0 - 0.9 * keep)
+        sk_s = skin * (0.45 + 0.55 * _skin_tone(base))           # smoothing mask: favour real skin
+
+        adj = base_f.copy()
+
+        # 1. Smoothing (low-frequency layer; texture handled at full res below)
+        if smooth > 0:
+            bil = cv2.bilateralFilter(base, 7, 25 + 35 * smooth, 5)
+            bil = cv2.bilateralFilter(bil, 7, 25 + 35 * smooth, 5).astype(np.float32)
+            _blend(adj, bil, sk_s * (0.45 + 0.55 * smooth))
+
+        # 2. Whitening in LAB: style-driven grade, scaled down on already-bright skin, highlights protected
+        if white > 0:
+            lab = cv2.cvtColor(np.clip(adj, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+            L = lab[..., 0] / 255.0
+            skin_mean = float((L * skin).sum() / (skin.sum() + 1e-6))
+            wk = white * float(np.clip((0.88 - skin_mean) / 0.30, 0.35, 1.0))     # bright scene => gentler
+            g_str, a_add, b_red, b_add, lift = 0.32, 1.0, 0.15, 0.0, 0.0
+            hl = np.clip((L - 0.78) / 0.17, 0, 1)                                   # highlight protection
+            lab2 = lab.copy()
+            lab2[..., 0] = np.clip(np.power(L, 1.0 - g_str * wk) * 255.0 + 4 * wk + lift * (1 - L) * wk, 0, 255)
+            lab2[..., 1] = 128 + (lab[..., 1] - 128) * (1 - 0.08 * wk) + a_add * wk
+            lab2[..., 2] = 128 + (lab[..., 2] - 128) * (1 - b_red * wk) + b_add * wk
+            wh = cv2.cvtColor(np.clip(lab2, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+            _blend(adj, wh, skin * (0.5 + 0.5 * wk))
+            nb = (ps[6] + ps[4]) * 0.5
+            for ctr, ax in ((nb, (fws * 0.035, fws * 0.13)), ((ps[10] + ps[9]) * 0.5, (fws * 0.20, fws * 0.07)),
+                            (ps[152] - down * fws * 0.05, (fws * 0.07, fws * 0.035))):
+                m = _soft_ellipse((h, w), ctr, ax, angle + (90 if ax[1] > ax[0] else 0), fws * 0.05)
+                _blend(adj, np.clip(adj * 1.12 + 10, 0, 255), m * 0.55 * wk * skin * (1 - hl))
+
+        # 2b. Style grade (independent of the Whitening slider)
+        if style[0] > 0:
+            lab = cv2.cvtColor(np.clip(adj, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+            Ls = lab[..., 0] / 255.0
+            Ls = np.power(Ls * (1 - style[4]) + style[4], 1.0 - style[0])
+            lab[..., 0] = np.clip(Ls * 255.0, 0, 255)
+            lab[..., 1] = 128 + (lab[..., 1] - 128) * style[3] + style[1]
+            lab[..., 2] = 128 + (lab[..., 2] - 128) * style[3] + style[2]
+            gr = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+            _blend(adj, gr, skin * 0.9)
+
+        # 3. Eyes: brighten under-eye shadows, add clarity
+        if eyes > 0:
+            for outline, centre, ew, _ in _eye_info(ps):
+                m = _soft_ellipse((h, w), centre + down * ew * 0.42, (ew * 0.55, ew * 0.2), angle, ew * 0.12)
+                _blend(adj, np.clip(adj * 1.10 + 9, 0, 255), m * 0.7 * eyes * skin)
+                em = _poly_mask((h, w), ps[outline], max(0.8, fws * 0.008))
+                blur = cv2.GaussianBlur(adj, (0, 0), max(1.0, fws * 0.012))
+                _blend(adj, np.clip(adj + (adj - blur) * 1.4, 0, 255), em * 0.8 * eyes)
+
+        # 4. Rosy cheeks and soft lips (lip colour keeps the lip texture)
+        if blush > 0:
+            for idx in (205, 425):
+                m = _soft_ellipse((h, w), ps[idx], (fws * 0.13, fws * 0.09), angle, fws * 0.06)
+                _blend(adj, (125, 115, 238), m * 0.45 * blush * skin)
+            lips = _poly_mask((h, w), ps[_MOUTH_OUTER_LOOP], max(0.8, fws * 0.008))
+            lips = lips * (1.0 - _poly_mask((h, w), ps[_MOUTH_INNER_LOOP], 0.8) * 0.95)
+            g = cv2.cvtColor(np.clip(adj, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            lipcol = np.clip(g[..., None] * 1.15, 0, 1) * np.array([126, 95, 247], np.float32)
+            _blend(adj, lipcol, lips * 0.55 * blush)
+
+        # 5. Soft glow (dreamy bloom on skin)
+        if glow > 0:
+            gl = cv2.GaussianBlur(adj, (0, 0), max(2.0, fws * 0.05))
+            screen = 255.0 - (255.0 - adj) * (255.0 - gl) / 255.0
+            _blend(adj, screen, skin * 0.6 * glow)
+
+        # --- recombine at full resolution: graded low-pass + (reduced) original texture ---
+        low_base = cv2.resize(base_f, (W, H), interpolation=cv2.INTER_LINEAR)
+        tex = full.astype(np.float32) - low_base
+        sk_full = cv2.resize(sk_s, (W, H), interpolation=cv2.INTER_LINEAR)
+        tex *= (1.0 - 0.8 * smooth * sk_full)[..., None]
+        res = cv2.resize(adj, (W, H), interpolation=cv2.INTER_LINEAR) + tex
+        out[y0:y1, x0:x1] = np.clip(res, 0, 255).astype(np.uint8)
+    return out
+
 # Effect registry — None pinned first, rest sorted alphabetically by label
 _EFFECTS_RAW = {
     'none':          {'label': 'None',               'icon': '🚫', 'fn': fx_none,          'controls': []},
@@ -2076,6 +2277,7 @@ _EFFECTS_RAW = {
     'vampire_teeth': {'label': 'Vampire',      'icon': '🧛', 'fn': fx_vampire_teeth, 'controls': [('vampireSize','Fang Size','%',60,150,100,'int'), ('vampireEyeHue','Iris Color (hue)','',0,179,0,'int'), ('vampireWings','Bat Wing Size (0 = off)','%',0,150,100,'int')]},
     'vintage_sepia': {'label': 'Vintage/Sepia',      'icon': '📷', 'fn': fx_vintage_sepia, 'controls': []},
     'water_push':    {'label': 'Water Push',         'icon': '💧', 'fn': fx_water_push,    'controls': [('waterStrength','Strength','',1,80,30,'int')]},
+    'beauty':        {'label': 'Beauty (美颜)',       'icon': '🌸', 'fn': fx_beauty,        'controls': [('beautyStyle','Style',['Natural','Pink-White  粉白','Cool-White  冷白','Japanese Soft  日系'],0,3,1,'choice'),('beautySmooth','Skin Smoothing','%',0,100,70,'int'),('beautyWhite','Whitening','%',0,80,40,'int'),('beautyEyes','Big Eyes','%',0,80,40,'int'),('beautySlim','Slim Face','%',0,75,40,'int'),('beautyBlush','Rosy Cheeks & Lips','%',0,100,40,'int'),('beautyGlow','Soft Glow','%',0,60,30,'int')]},
     'so_pretty':     {'label': 'So Pretty',          'icon': '💄', 'fn': fx_so_pretty,     'controls': []},
     'sid_eyes':      {'label': 'Sid Eyes',           'icon': '🦥', 'fn': fx_sid_eyes,      'controls': [('sidShift','Eye Shift','px',0,30,15,'int')]},
     'xray':          {'label': 'X-Ray',              'icon': '🦴', 'fn': fx_xray,          'controls': [('xrayContrast','Contrast','%',10,100,60,'int')]},

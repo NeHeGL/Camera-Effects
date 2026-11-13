@@ -209,7 +209,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._populate_cameras()
-        self.resize(1310, 900)
+        self.resize(1420, 950)
         self.show()
 
     def _build_ui(self):
@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
     # ── Effects panel (left) ─────────────────────────────────────
     def _build_effects_panel(self):
         panel = QGroupBox('✨ Special Effects')
-        panel.setFixedWidth(290)
+        panel.setFixedWidth(400)
         layout = QVBoxLayout(panel)
         layout.setSpacing(4)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -250,17 +250,20 @@ class MainWindow(QMainWindow):
             btn.setChecked(key == 'none')
             if key == 'none':
                 btn.setStyleSheet('font-weight: bold; color: #00cfff;')
-            btn.setFixedHeight(52)
+            btn.setFixedHeight(44)
             btn.clicked.connect(lambda checked, k=key: self._select_effect(k))
             self.effect_btns[key] = btn
-            grid.addWidget(btn, i // 2, i % 2)
+            grid.addWidget(btn, i // 3, i % 3)
+        grid.setRowStretch(len(EFFECTS) // 3 + 1, 1)   # keep rows compact when there is spare height
 
         scroll.setWidget(inner)
         layout.addWidget(scroll, 1)
 
         # Fixed-height controls area — always reserves space so buttons never move.
         self.effect_controls_box = QGroupBox('Effect Controls')
-        self.effect_controls_box.setFixedHeight(110)
+        # Sized for the effect with the most controls (each slider = label + bar)
+        max_ctrls = max(len(v.get('controls', [])) for v in EFFECTS.values())
+        self.effect_controls_box.setFixedHeight(34 + 40 * max_ctrls)
         self.effect_controls_box.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.effect_controls_layout = QVBoxLayout(self.effect_controls_box)
@@ -533,7 +536,17 @@ class MainWindow(QMainWindow):
         info = EFFECTS[key]
         for ctrl in info.get('controls', []):
             state_key, label, unit, lo, hi, default, parse = ctrl
-            if parse == 'bool':
+            if parse == 'choice':
+                from PyQt6.QtWidgets import QComboBox
+                lbl = QLabel(f'{label}:')
+                combo = QComboBox()
+                combo.addItems(list(unit))
+                combo.setCurrentIndex(int(self.effect_state.get(state_key, default)))
+                self.effect_state.setdefault(state_key, default)
+                combo.currentIndexChanged.connect(lambda i, sk=state_key: self.effect_state.update({sk: i}))
+                self.effect_controls_layout.addWidget(lbl)
+                self.effect_controls_layout.addWidget(combo)
+            elif parse == 'bool':
                 # Render as a checkbox (lo/hi/unit ignored)
                 from PyQt6.QtWidgets import QCheckBox
                 cb = QCheckBox(label)
